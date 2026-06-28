@@ -534,6 +534,21 @@ def ensure_chain(bin_):
     if _run([bin_, "-C", "INPUT", "-j", CHAIN]).returncode != 0:
         _run([bin_, "-I", "INPUT", "1", "-j", CHAIN])
 
+def save_rules():
+    """Persist iptables rules to /etc/iptables/rules.v4 (and rules.v6)."""
+    import os
+    os.makedirs("/etc/iptables", exist_ok=True)
+    for binary, path in (("iptables-save", "/etc/iptables/rules.v4"),
+                         ("ip6tables-save", "/etc/iptables/rules.v6")):
+        res = _run([binary])
+        if res.returncode == 0:
+            try:
+                with open(path, "w") as f:
+                    f.write(res.stdout)
+            except OSError:
+                pass
+
+
 def block_source(source):
     """Block an IP address or CIDR subnet (e.g. '1.2.3.4' or '1.2.3.0/24')."""
     # Detect IPv6 by a colon that isn't part of a CIDR prefix
@@ -544,6 +559,7 @@ def block_source(source):
         return ("skip", "already blocked")
     res = _run([bin_, "-A", CHAIN, "-s", source, "-j", "DROP"])
     if res.returncode == 0:
+        save_rules()
         return ("ok", "DROP added")
     return ("err", (res.stderr or res.stdout).strip())
 
