@@ -534,16 +534,60 @@ def ensure_chain(bin_):
     if _run([bin_, "-C", "INPUT", "-j", CHAIN]).returncode != 0:
         _run([bin_, "-I", "INPUT", "1", "-j", CHAIN])
 
-def block_ip(ip):
-    bin_ = "ip6tables" if ":" in ip else "iptables"
+def block_source(source):
+    """Block an IP address or CIDR subnet (e.g. '1.2.3.4' or '1.2.3.0/24')."""
+    # Detect IPv6 by a colon that isn't part of a CIDR prefix
+    is6 = ":" in source.split("/")[0]
+    bin_ = "ip6tables" if is6 else "iptables"
     ensure_chain(bin_)
-    # already present?
-    if _run([bin_, "-C", CHAIN, "-s", ip, "-j", "DROP"]).returncode == 0:
+    if _run([bin_, "-C", CHAIN, "-s", source, "-j", "DROP"]).returncode == 0:
         return ("skip", "already blocked")
-    res = _run([bin_, "-A", CHAIN, "-s", ip, "-j", "DROP"])
+    res = _run([bin_, "-A", CHAIN, "-s", source, "-j", "DROP"])
     if res.returncode == 0:
         return ("ok", "DROP added")
     return ("err", (res.stderr or res.stdout).strip())
+
+
+# Keep old name as alias for backward compat
+block_ip = block_source
+
+
+def subnet_report(rows):
+    """Aggregate flagged IPs by /24 (IPv4) or /48 (IPv6) and show hot subnets."""
+    from collections import defaultdict
+    nets = defaultdict(list)
+    for r in rows:
+        ip = r["ip"]
+        try:
+            addr = ipaddress.ip_address(ip)
+            if addr.version == 4:
+                net = str(ipaddress.ip_network(f"{ip}/24", strict=False))
+            else:
+                net = str(ipaddress.ip_network(f"{ip}/48", strict=False))
+        except ValueError:
+            continue
+        nets[net].append(r)
+
+    clusters = [(net, rs) for net, rs in nets.items() if len(rs) >= 3]
+    if not clusters:
+        return
+    clusters.sort(key=lambda x: -sum(r["hits"] for r in x[1]))
+
+    print(col("\n  ── SUBNET CLUSTERS (3+ offenders in same /24 or /48) ──", C.B + C.CYAN))
+    hdr = f"  {'SUBNET':<22}{'IPs':>5}{'TOTAL HITS':>12}  {'COUNTRY':<15}{'ISP / ORG'}"
+    print(col(hdr, C.CYAN))
+    print(col("  " + "─" * 90, C.DIM + C.GREY))
+    for net, rs in clusters:
+        total_hits = sum(r["hits"] for r in rs)
+        country = rs[0].get("country") or "?"
+        isp = rs[0].get("isp") or "?"
+        print(f"  {col(net, C.WHITE):<31}{len(rs):>5}{col(str(total_hits), C.GREEN):>20}  "
+              f"{country[:14]:<15}{col(isp[:40], C.PINK)}")
+    print(col("  " + "─" * 90, C.DIM + C.GREY))
+    print(col(f"  Tip: block a whole subnet with  ", C.GREY) +
+          col(f"iptables -A {CHAIN} -s <subnet> -j DROP", C.CYAN))
+    print()
+    return clusters
 
 
 def apply_bans(selected):
@@ -551,7 +595,7 @@ def apply_bans(selected):
     print(col("  Applying iptables rules…", C.B + C.CYAN))
     ok = err = skip = 0
     for r in selected:
-        st, msg = block_ip(r["ip"])
+        st, msg = block_source(r["ip"])
         if st == "ok":
             ok += 1
             print(col(f"  ✔ BLOCKED {r['ip']:<40}", C.GREEN) + col(msg, C.GREY))
@@ -569,6 +613,58 @@ def apply_bans(selected):
               col(f"iptables -nL {CHAIN}", C.CYAN))
         print(col("  To undo everything: ", C.GREY) +
               col(f"iptables -F {CHAIN}", C.CYAN))
+
+
+def apply_subnet_bans(clusters):
+    """Interactively block whole /24 subnets identified as swarms."""
+    if not clusters:
+        return
+    print(col("\n  ── SUBNET BLOCK ──", C.B + C.RED))
+    print(col("  The subnets below each have 3+ scrapers. Block the whole /24 instead of", C.GREY))
+    print(col("  individual IPs to stop respawning scrapers pre-emptively.", C.GREY))
+    print()
+    choices = []
+    for i, (net, rs) in enumerate(clusters):
+        total = sum(r["hits"] for r in rs)
+        isp = rs[0].get("isp") or "?"
+        country = rs[0].get("country") or "?"
+        print(col(f"  [{i+1}] {net:<22}", C.WHITE) +
+              col(f" {len(rs)} IPs / {total} hits", C.GREEN) +
+              col(f"  {country} — {isp}", C.GREY))
+        choices.append(net)
+    print()
+    try:
+        ans = input(col("  Enter subnet numbers to block (e.g. 1,3) or 'a' for all, ENTER to skip: ",
+                        C.B + C.CYAN)).strip().lower()
+    except EOFError:
+        return
+    if not ans:
+        return
+    if ans == "a":
+        selected_nets = choices
+    else:
+        try:
+            idxs = [int(x.strip()) - 1 for x in ans.split(",")]
+            selected_nets = [choices[i] for i in idxs if 0 <= i < len(choices)]
+        except (ValueError, IndexError):
+            print(col("  Invalid input; skipping subnet blocks.", C.YELLOW))
+            return
+    if not selected_nets:
+        return
+    ok = err = skip = 0
+    for net in selected_nets:
+        st, msg = block_source(net)
+        if st == "ok":
+            ok += 1
+            print(col(f"  ✔ BLOCKED subnet {net:<28}", C.GREEN) + col(msg, C.GREY))
+        elif st == "skip":
+            skip += 1
+            print(col(f"  • SKIP    subnet {net:<28}", C.YELLOW) + col(msg, C.GREY))
+        else:
+            err += 1
+            print(col(f"  ✗ ERROR  subnet {net:<28}", C.RED) + col(msg, C.GREY))
+    print(col(f"\n  Subnets: {ok} blocked, {skip} already present, {err} errors.",
+              C.B + (C.GREEN if err == 0 else C.RED)))
 
 
 # -----------------------------------------------------------------------------
@@ -648,6 +744,9 @@ def main():
 
     print_report(rows)
 
+    # Show subnet clusters — groups of 3+ offending IPs in the same /24
+    clusters = subnet_report(rows)
+
     if args.no_ban:
         print(col("  --no-ban set; report only.", C.YELLOW))
         return
@@ -656,12 +755,17 @@ def main():
                   "Re-run with sudo to ban.", C.YELLOW))
         return
 
+    # Offer subnet-level blocking first when swarms are detected
+    if clusters:
+        apply_subnet_bans(clusters)
+
     try:
-        ans = input(col("  Open interactive ban selector? [Y/n] ", C.B + C.CYAN)).strip().lower()
+        ans = input(col("  Open interactive ban selector (individual IPs)? [Y/n] ",
+                        C.B + C.CYAN)).strip().lower()
     except EOFError:
         ans = "n"
     if ans in ("n", "no"):
-        print(col("  Aborted; no IPs banned.", C.YELLOW))
+        print(col("  Aborted; no individual IPs banned.", C.YELLOW))
         return
 
     confirmed = run_selector(rows)
