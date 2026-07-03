@@ -486,7 +486,8 @@ def _fallback_selector(rows):
     print("\n  Interactive TUI unavailable (no terminal). Using text mode.\n")
     for i, r in enumerate(rows, 1):
         print(f"  [{i:>3}] {r['ip']:<22}{r['hits']:>6} hits  "
-              f"{(r['country'] or '?')[:12]:<13}{r['label']}")
+              f"{(r['country'] or '?')[:12]:<13}{(r['isp'] or '?')[:20]:<21}"
+              f"{r['label']:<11}{r.get('targets', '-')}")
     print()
     try:
         raw = input("  Enter numbers to ban (e.g. 1,3,5) or 'a' for all, ENTER to cancel: ").strip().lower()
