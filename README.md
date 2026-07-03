@@ -94,19 +94,26 @@ sudo ./apache_abuse_guard.py \
 | `--min-count` | `50`                             | Minimum requests for an IP to be considered          |
 | `--top`       | `200`                            | Cap the report to the N worst offenders              |
 | `--no-geo`    | off                              | Skip the country/ISP lookup                          |
+| `--no-rdns`   | off                              | Skip reverse-DNS verification of search-engine UAs   |
 | `--no-ban`    | off                              | Report only — never modify the firewall              |
 
 ## How detection works
 
 Each source IP is aggregated and classified:
 
-- **`BRUTEFORCE`** (red, pre-selected) — `≥10` auth-path hits, or `≥25` `401/403`,
-  or `≥25` denied entries in the error log, or a sustained `POST` + auth-path pattern.
-- **`SCRAPING`** (yellow) — a known bot user-agent with `≥50` hits, or very
+- **`BRUTEFORCE`** (red, pre-selected) — `≥10` failed/POSTed auth-path hits, or
+  `≥25` `401/403`, or `≥25` denied entries in the error log, or a sustained
+  `POST` + auth-path pattern. Auth-path hits only count when the request was a
+  `POST` or came back `401/403/404` — a user rendering `/login` is not an attack.
+- **`SCANNING`** (orange) — `≥50` `404`s making up at least half of the IP's
+  traffic: a vulnerability scanner walking a wordlist of paths that don't exist.
+- **`SCRAPING`** (yellow) — a dominant bot user-agent with `≥50` hits, or very
   high-volume crawling across a wide URL surface — *unless* the UA is a recognized
-  search engine.
-- **`OTHER`** (orange/grey/purple) — aggressive `404` probing, known-good search
-  engines, or simply high-volume traffic worth a look.
+  search engine. Search-engine UAs are only trusted after reverse-DNS →
+  forward-DNS confirmation (Googlebot must really resolve to `*.googlebot.com`);
+  spoofed ones are flagged as `fake search-engine UA`.
+- **`OTHER`** (grey/purple) — verified search engines, or simply high-volume
+  traffic worth a look.
 
 ## What it does to your firewall
 

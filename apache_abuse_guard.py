@@ -23,10 +23,12 @@ import ipaddress
 import json
 import os
 import re
+import socket
 import sys
 import time
 import urllib.request
 from collections import Counter
+from functools import lru_cache
 
 # -----------------------------------------------------------------------------
 # Palette (bpytop-ish: dark, neon accents). 256-color ANSI for the static report.
@@ -81,6 +83,16 @@ LEGIT_UA_RE = re.compile(
     r"(googlebot|google-inspectiontool|storebot-google|bingbot|adidxbot|"
     r"duckduckbot|yandexbot|applebot|baiduspider|slurp|uptimerobot|"
     r"pingdom|wordpress/)",
+    re.IGNORECASE,
+)
+
+# rDNS domains the LEGIT_UA_RE services actually crawl from. A claimed
+# search-engine UA only earns trust if the IP's PTR record lands in one of
+# these (and forward DNS confirms it).
+SEARCH_ENGINE_HOST_RE = re.compile(
+    r"\.(googlebot\.com|google\.com|search\.msn\.com|crawl\.yahoo\.net|"
+    r"yandex\.(?:ru|net|com)|apple\.com|baidu\.(?:com|jp)|duckduckgo\.com|"
+    r"uptimerobot\.com|pingdom\.com)$",
     re.IGNORECASE,
 )
 
@@ -196,7 +208,7 @@ def strip_port(token):
 # -----------------------------------------------------------------------------
 class Stat:
     __slots__ = ("ip", "hits", "post", "get", "auth_hits", "unauth", "notfound",
-                 "path_counts", "bytes", "scraper_ua", "legit_ua", "denied", "ua_counts",
+                 "path_counts", "bytes", "denied", "ua_counts",
                  "country", "isp")
 
     def __init__(self, ip):
@@ -209,8 +221,6 @@ class Stat:
         self.notfound = 0      # 404
         self.path_counts = Counter()
         self.bytes = 0
-        self.scraper_ua = False
-        self.legit_ua = False
         self.denied = 0        # from error.log
         self.ua_counts = Counter()
         self.country = "?"
@@ -239,11 +249,16 @@ def parse_access(path, stats):
                 s.post += 1
             elif method == "GET":
                 s.get += 1
+            path = url.split("?", 1)[0]
             if url:
-                s.path_counts[url.split("?", 1)[0]] += 1
-            if AUTH_PATH_RE.search(url):
-                s.auth_hits += 1
+                s.path_counts[path] += 1
             status = m.group("status")
+            # Only failed or POSTed auth-path hits count as probing; a GET of
+            # /login that returns 200 is a user rendering the page. Match on
+            # the path only, so '?redirect=/login' doesn't count.
+            if (AUTH_PATH_RE.search(path) and
+                    (method == "POST" or status in ("401", "403", "404"))):
+                s.auth_hits += 1
             if status in ("401", "403"):
                 s.unauth += 1
             elif status == "404":
@@ -252,14 +267,7 @@ def parse_access(path, stats):
             if size.isdigit():
                 s.bytes += int(size)
             ua = m.group("ua")
-            if ua and ua != "-":
-                s.ua_counts[ua] += 1
-                if SCRAPER_UA_RE.search(ua):
-                    s.scraper_ua = True
-                if LEGIT_UA_RE.search(ua):
-                    s.legit_ua = True
-            else:
-                s.ua_counts["-"] += 1
+            s.ua_counts[ua if ua and ua != "-" else "-"] += 1
 
 
 def parse_error(path, stats):
@@ -279,9 +287,59 @@ def parse_error(path, stats):
 # -----------------------------------------------------------------------------
 # Classification
 # -----------------------------------------------------------------------------
-def classify(s):
-    """Return (label, color, reason, preselect)."""
-    bf_score = s.auth_hits + s.unauth + s.denied
+def _verify_search_engine(ip, gethostbyaddr, getaddrinfo):
+    """rDNS -> forward-DNS confirmation that `ip` really belongs to a search
+    engine / monitoring service. UA strings are attacker-chosen, so a claimed
+    Googlebot must resolve to *.googlebot.com AND that hostname must resolve
+    back to the same IP."""
+    def norm(a):
+        try:
+            return ipaddress.ip_address(a.split("%")[0]).compressed
+        except ValueError:
+            return a
+    try:
+        host = gethostbyaddr(ip)[0]
+    except OSError:
+        return False
+    if not SEARCH_ENGINE_HOST_RE.search(host):
+        return False
+    try:
+        infos = getaddrinfo(host, None)
+    except OSError:
+        return False
+    want = norm(ip)
+    return any(norm(info[4][0]) == want for info in infos)
+
+
+@lru_cache(maxsize=None)
+def verify_search_engine(ip):
+    return _verify_search_engine(ip, socket.gethostbyaddr, socket.getaddrinfo)
+
+
+def ua_class(s):
+    """Classify an IP's UA mix by share of requests: (scraper_ua, legit_ua).
+
+    A majority of requests must carry the UA class, so a single stray hit
+    (one spoofed Googlebot request among scrapes, one curl probe among
+    browser traffic) can't flip the whole IP."""
+    total = sum(s.ua_counts.values())
+    if not total:
+        return False, False
+    scraper = sum(c for ua, c in s.ua_counts.items()
+                  if ua != "-" and SCRAPER_UA_RE.search(ua))
+    legit = sum(c for ua, c in s.ua_counts.items()
+                if ua != "-" and LEGIT_UA_RE.search(ua))
+    return scraper * 2 >= total, legit * 2 >= total
+
+
+def classify(s, rdns_verify=None):
+    """Return (label, color, reason, preselect).
+
+    rdns_verify: optional callable(ip) -> bool that confirms a claimed
+    search-engine UA via reverse DNS; None trusts the UA string as-is."""
+    scraper_ua, legit_claim = ua_class(s)
+    legit_ua = legit_claim and (rdns_verify is None or rdns_verify(s.ip))
+    spoofed = legit_claim and not legit_ua
     # BRUTEFORCE: hammering auth/exploit endpoints or piling up 401/403/denied.
     if (s.auth_hits >= 10 or s.unauth >= 25 or s.denied >= 25 or
             (s.auth_hits >= 5 and s.post >= 5)):
@@ -294,28 +352,35 @@ def classify(s):
             bits.append(f"{s.denied} denied(err)")
         return "BRUTEFORCE", C.RED, ", ".join(bits) or "auth probing", True
 
+    # SCANNING: traffic that is mostly 404s = probing for files that
+    # aren't there (vuln scanners walking wordlists).
+    if s.notfound >= 50 and s.notfound * 2 >= s.hits:
+        return "SCANNING", C.ORANGE, f"{s.notfound}x 404 probing", False
+
     # SCRAPING: automated UA OR very high-volume, wide-surface crawling.
-    if not s.legit_ua and (
-        (s.scraper_ua and s.hits >= 50) or
+    if not legit_ua and (
+        (scraper_ua and s.hits >= 50) or
         (s.get >= 300 and len(s.path_counts) >= 100) or
         (s.hits >= 800 and len(s.path_counts) >= 50)
     ):
         bits = []
-        if s.scraper_ua:
+        if spoofed:
+            bits.append("fake search-engine UA")
+        if scraper_ua:
             bits.append("bot UA")
         bits.append(f"{len(s.path_counts)} URLs / {s.get} GET")
         # Not pre-selected: scraping is often legitimate-ish (AI/SEO bots);
         # leave the choice to the operator. Only bruteforce is pre-ticked.
         return "SCRAPING", C.YELLOW, ", ".join(bits), False
 
-    # Aggressive 404 probing without auth match → still suspicious.
-    if s.notfound >= 50 and s.hits >= 80:
-        return "OTHER", C.ORANGE, f"{s.notfound}x 404 probing", False
+    if legit_ua:
+        return "OTHER", C.GREY, ("verified search engine" if rdns_verify
+                                 else "known search engine / WP"), False
 
-    if s.legit_ua:
-        return "OTHER", C.GREY, "known search engine / WP", False
-
-    return "OTHER", C.PURPLE, f"{s.hits} hits, {len(s.path_counts)} URLs", False
+    reason = f"{s.hits} hits, {len(s.path_counts)} URLs"
+    if spoofed:
+        reason = "fake search-engine UA, " + reason
+    return "OTHER", C.PURPLE, reason, False
 
 
 # -----------------------------------------------------------------------------
@@ -379,10 +444,12 @@ def print_report(rows):
         print(f"  {ipc}{hitc}  {ctry:<15}{isp:<20}{lbl}{agent}{detail}{targets}")
     print(col("  " + "─" * 150, C.DIM + C.GREY))
     bf = sum(1 for r in rows if r["label"] == "BRUTEFORCE")
+    sn = sum(1 for r in rows if r["label"] == "SCANNING")
     sc = sum(1 for r in rows if r["label"] == "SCRAPING")
     ot = sum(1 for r in rows if r["label"] == "OTHER")
     print(col(f"  {len(rows)} suspicious IPs  ", C.B) +
           col(f"{bf} bruteforce", C.RED) + col(" · ", C.GREY) +
+          col(f"{sn} scanning", C.ORANGE) + col(" · ", C.GREY) +
           col(f"{sc} scraping", C.YELLOW) + col(" · ", C.GREY) +
           col(f"{ot} other", C.PURPLE))
     print()
@@ -394,7 +461,7 @@ def print_report(rows):
 def run_selector(rows):
     import curses
 
-    LABEL_PAIR = {"BRUTEFORCE": 1, "SCRAPING": 2, "OTHER": 3}
+    LABEL_PAIR = {"BRUTEFORCE": 1, "SCANNING": 8, "SCRAPING": 2, "OTHER": 3}
 
     def _ui(stdscr):
         curses.curs_set(0)
@@ -410,6 +477,11 @@ def run_selector(rows):
             curses.init_pair(7, curses.COLOR_BLACK, curses.COLOR_CYAN)
         except curses.error:
             pass
+        try:
+            # orange for SCANNING on 256-color terminals; red otherwise
+            curses.init_pair(8, 208 if curses.COLORS >= 256 else curses.COLOR_RED, -1)
+        except curses.error:
+            curses.init_pair(8, curses.COLOR_RED, -1)
 
         pos = 0
         top = 0
@@ -755,6 +827,8 @@ def main():
     ap.add_argument("--top", type=int, default=200,
                     help="cap report to N worst offenders (default 200)")
     ap.add_argument("--no-geo", action="store_true", help="skip country/ISP lookup")
+    ap.add_argument("--no-rdns", action="store_true",
+                    help="skip reverse-DNS verification of search-engine UAs")
     ap.add_argument("--no-ban", action="store_true", help="report only, never ban")
     args = ap.parse_args()
 
@@ -779,12 +853,16 @@ def main():
                   "matching IPs will be hidden.", C.GREY))
 
     # classify + filter
+    rdns = None if args.no_rdns else verify_search_engine
+    if rdns:
+        print(col("  Search-engine user-agents are verified via rDNS "
+                  "(--no-rdns to skip).", C.GREY))
     rows = []
     already_blocked = 0
     for ip, s in stats.items():
-        label, color, reason, pre = classify(s)
+        label, color, reason, pre = classify(s, rdns)
         # keep flagged ones, plus any high-volume IP above min-count
-        if label in ("BRUTEFORCE", "SCRAPING") or s.hits >= args.min_count:
+        if label in ("BRUTEFORCE", "SCANNING", "SCRAPING") or s.hits >= args.min_count:
             if is_blocked(ip, blocked_nets):
                 already_blocked += 1
                 continue
@@ -808,8 +886,8 @@ def main():
                   C.GREEN))
         return
 
-    # rank: bruteforce > scraping > other, then by hits
-    order = {"BRUTEFORCE": 0, "SCRAPING": 1, "OTHER": 2}
+    # rank: bruteforce > scanning > scraping > other, then by hits
+    order = {"BRUTEFORCE": 0, "SCANNING": 1, "SCRAPING": 2, "OTHER": 3}
     rows.sort(key=lambda r: (order[r["label"]], -r["hits"]))
     rows = rows[:args.top]
 
