@@ -477,13 +477,24 @@ def run_selector(rows):
 
     try:
         return curses.wrapper(_ui)
-    except Exception:
-        return _fallback_selector(rows)
+    except curses.error as e:
+        # Unknown TERM (terminfo for the user's terminal not installed on this
+        # host, e.g. xterm-ghostty) — retry with a universally available entry.
+        if "could not find terminal" in str(e):
+            os.environ["TERM"] = "xterm-256color"
+            try:
+                return curses.wrapper(_ui)
+            except Exception as e2:
+                e = e2
+        return _fallback_selector(rows, reason=str(e))
+    except Exception as e:
+        return _fallback_selector(rows, reason=str(e))
 
 
-def _fallback_selector(rows):
+def _fallback_selector(rows, reason=""):
     """Plain-text fallback selector when curses is unavailable."""
-    print("\n  Interactive TUI unavailable (no terminal). Using text mode.\n")
+    detail = f": {reason}" if reason else ""
+    print(f"\n  Interactive TUI unavailable{detail}. Using text mode.\n")
     for i, r in enumerate(rows, 1):
         print(f"  [{i:>3}] {r['ip']:<22}{r['hits']:>6} hits  "
               f"{(r['country'] or '?')[:12]:<13}{(r['isp'] or '?')[:20]:<21}"
