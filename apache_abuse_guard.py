@@ -475,7 +475,48 @@ def run_selector(rows):
             elif k in (27, ord("q")):
                 return False
 
-    return curses.wrapper(_ui)
+    try:
+        return curses.wrapper(_ui)
+    except Exception:
+        return _fallback_selector(rows)
+
+
+def _fallback_selector(rows):
+    """Plain-text fallback selector when curses is unavailable."""
+    print("\n  Interactive TUI unavailable (no terminal). Using text mode.\n")
+    for i, r in enumerate(rows, 1):
+        print(f"  [{i:>3}] {r['ip']:<22}{r['hits']:>6} hits  "
+              f"{(r['country'] or '?')[:12]:<13}{r['label']}")
+    print()
+    try:
+        raw = input("  Enter numbers to ban (e.g. 1,3,5) or 'a' for all, ENTER to cancel: ").strip().lower()
+    except EOFError:
+        raw = ""
+    if not raw:
+        return False
+    if raw == "a":
+        for r in rows:
+            r["selected"] = True
+    else:
+        indices = set()
+        invalid = []
+        for part in raw.split(","):
+            part = part.strip()
+            try:
+                idx = int(part) - 1
+                if 0 <= idx < len(rows):
+                    indices.add(idx)
+                else:
+                    invalid.append(part)
+            except ValueError:
+                if part:
+                    invalid.append(part)
+        if invalid:
+            print(f"  Warning: ignored invalid tokens: {', '.join(invalid)}")
+        for i, r in enumerate(rows):
+            r["selected"] = i in indices
+    return True
+
 
 
 # -----------------------------------------------------------------------------
@@ -536,15 +577,19 @@ def ensure_chain(bin_):
 
 def save_rules():
     """Persist iptables rules to /etc/iptables/rules.v4 (and rules.v6)."""
-    import os
     os.makedirs("/etc/iptables", exist_ok=True)
     for binary, path in (("iptables-save", "/etc/iptables/rules.v4"),
                          ("ip6tables-save", "/etc/iptables/rules.v6")):
-        res = _run([binary])
+        try:
+            res = _run([binary])
+        except OSError:
+            continue
         if res.returncode == 0:
+            tmp = path + ".tmp"
             try:
-                with open(path, "w") as f:
+                with open(tmp, "w") as f:
                     f.write(res.stdout)
+                os.replace(tmp, path)
             except OSError:
                 pass
 
@@ -559,7 +604,6 @@ def block_source(source):
         return ("skip", "already blocked")
     res = _run([bin_, "-A", CHAIN, "-s", source, "-j", "DROP"])
     if res.returncode == 0:
-        save_rules()
         return ("ok", "DROP added")
     return ("err", (res.stderr or res.stdout).strip())
 
@@ -621,6 +665,8 @@ def apply_bans(selected):
         else:
             err += 1
             print(col(f"  ✗ ERROR  {r['ip']:<40}", C.RED) + col(msg, C.GREY))
+    if ok:
+        save_rules()
     print()
     print(col(f"  Done: {ok} blocked, {skip} already present, {err} errors.",
               C.B + (C.GREEN if err == 0 else C.RED)))
@@ -679,6 +725,8 @@ def apply_subnet_bans(clusters):
         else:
             err += 1
             print(col(f"  ✗ ERROR  subnet {net:<28}", C.RED) + col(msg, C.GREY))
+    if ok:
+        save_rules()
     print(col(f"\n  Subnets: {ok} blocked, {skip} already present, {err} errors.",
               C.B + (C.GREEN if err == 0 else C.RED)))
 
